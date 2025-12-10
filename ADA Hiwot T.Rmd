@@ -1,0 +1,576 @@
+---
+title: "ADA"
+author: "Hiwot Tebeje"
+date: "2025-12-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Install packages
+```{r}
+install.packages("srvyr")
+install.packages("mice")
+install.packages("readr")
+install.packages("VIM")
+install.packages("lattice")
+install.packages("ResourceSelection")
+install.packages("pROC")
+```
+#Load packages
+```{r}
+library(tidyverse)
+library(haven)
+library(survey)
+library(srvyr)
+library(mice)
+library(broom)
+library(janitor)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(lattice)
+library(VIM)
+library(car)               
+library(ResourceSelection) 
+library(pROC)
+library(table1)
+library(DiagrammeR)
+library(knitr)
+```
+#Load data
+```{r}
+mydata <- read_sav("C:/Users/Hiwot/Downloads/Hiwot_ADA.sav")
+```
+
+#Defining my study population: People who are 18 years and above,not pregnant, Complete depression and BMI value, calculate PHQ-9 and recode outcome
+```{r}
+analytic_data <- mydata %>%
+  # 1) Adults >= 18
+  filter(RIDAGEYR >= 18) %>%
+  
+  # 2) Exclude pregnant (RIDEXPRG = 1)
+  # Must use "|" not "||"
+  filter(is.na(RIDEXPRG) | RIDEXPRG != 1) %>%
+  
+  # 3) Calculate PHQ-9 total score
+  mutate(
+    PHQ9_total = DPQ010 + DPQ020 + DPQ030 + DPQ040 +
+                 DPQ050 + DPQ060 + DPQ070 + DPQ080 + DPQ090
+  ) %>%
+  
+  # 4) Keep complete PHQ-9 and BMI only
+  filter(
+    !is.na(PHQ9_total),
+    !is.na(BMXBMI)
+    # DO NOT FILTER OUT SLD012
+  ) %>%
+  
+  # 5) Define obesity and depression variables
+  mutate(
+    depressed = if_else(PHQ9_total >= 10, 1L, 0L),
+    obese     = if_else(BMXBMI >= 30,   1L, 0L)
+  ) %>%
+  
+  # 6) Keep exact variables needed for analysis
+  select(
+    SEQN,                       # participant ID
+    WTMEC2YR, SDMVPSU, SDMVSTRA, # weights & design
+    RIDAGEYR, RIAGENDR,          # age & sex covariates
+    SLD012,                      # sleep (may be missing)
+    BMXBMI,                      # BMI
+    PHQ9_total,                  # PHQ-9 score
+    depressed,                   # exposure
+    obese                        # outcome
+  )
+
+# Check final analytic N
+nrow(analytic_data)
+```
+
+#Check missing
+```{r}
+missing_summary <- data.frame(
+  Variable = names(analytic_data),
+  Missing_N = colSums(is.na(analytic_data)),
+  Missing_Percent = round(colSums(is.na(analytic_data)) / nrow(analytic_data) * 100, 2)
+)
+missing_summary
+```
+From the above I see that after defining the population I have 0.98% missingess in SLD012(average week day sleep hours).
+
+#Impute
+```{r}
+imp_vars <- analytic_data %>%
+  select(
+    SEQN,
+    obese, depressed,
+    RIDAGEYR, RIAGENDR,
+    SLD012,
+    PHQ9_total,
+    BMXBMI,
+    WTMEC2YR, SDMVPSU, SDMVSTRA   # weighting variables included
+  )
+
+# Run MICE with Predictive Mean Matching (PMM)
+imp_mids <- mice(
+  imp_vars,
+  m = 5,
+  method = "pmm",
+  seed = 2025
+)
+
+# Extract ONE complete dataset (you could pool, but this is acceptable)
+analytic_imp <- complete(imp_mids, action = 1)
+```
+#Imputation diagnostic
+```{r}
+names(imp_mids$imp)
+
+# Check imputations for SLD012 (Sleep duration)
+imp_mids$imp$SLD012
+
+# Check imputations for BMI
+imp_mids$imp$BMXBMI
+
+# Check imputations for PHQ-9 total
+imp_mids$imp$PHQ9_total
+```
+
+#extract imputed data sets
+```{r}
+analytic_imp <- complete(imp_mids, action = 1)
+
+saveRDS(analytic_imp, file = "analytic_imp_m1.rds")
+write.csv(analytic_imp, file = "analytic_imp_m1.csv", row.names = FALSE)
+saveRDS(imp_mids, file = "imp_mids_object.rds")
+
+```
+
+#Logistic regression
+```{r}
+design_imp <- svydesign(
+  id      = ~SDMVPSU,
+  strata  = ~SDMVSTRA,
+  weights = ~WTMEC2YR,
+  nest    = TRUE,
+  data    = analytic_imp
+)
+
+###############################################################
+# MAIN SURVEY-WEIGHTED LOGISTIC REGRESSION
+###############################################################
+# Outcome: obese (0/1)
+# Exposure: depressed (0/1)
+# Covariates: age, sex, sleep duration
+###############################################################
+
+fit_main <- svyglm(
+  obese ~ depressed + RIDAGEYR + RIAGENDR + SLD012,
+  design = design_imp,
+  family = quasibinomial()
+)
+
+summary(fit_main)
+
+###############################################################
+# ADJUSTED ODDS RATIOS + 95% CONFIDENCE INTERVALS
+###############################################################
+
+coef_est <- coef(fit_main)
+ci_est   <- confint(fit_main)
+
+aor_results <- data.frame(
+  Variable = names(coef_est),
+  aOR      = round(exp(coef_est), 3),
+  LCL      = round(exp(ci_est[, 1]), 3),
+  UCL      = round(exp(ci_est[, 2]), 3)
+)
+
+aor_results
+```
+Interpretations
+From the analysis, after adjusting for age, sex, and average week day sleep duration, individuals with depression had 39.6% higher odds of obesity compared to those without depression, and this association is statistically significant (AOR = 1.396; 95% CI: 1.006–1.937; p < 0.05). In addition, for every one-year increase in age, the odds of obesity increased by 0.8% (AOR = 1.008; 95% CI: 1.003–1.013; p < 0.01). Sleep duration demonstrated a protective effect, as each additional hour of sleep reduced the odds of obesity by approximately 9.5% (AOR = 0.905; 95% CI: 0.864–0.947; p < 0.001). Sex was not significantly associated with obesity in the adjusted model (AOR = 1.036; 95% CI: 0.890–1.206; p > 0.05).
+
+#Journal ready logistic regression table
+```{r}
+coef_est <- coef(fit_main)
+ci_est   <- confint(fit_main)
+p_vals   <- summary(fit_main)$coefficients[,4]
+
+results <- data.frame(
+  Variable = names(coef_est),
+  aOR      = exp(coef_est),
+  LCL      = exp(ci_est[,1]),
+  UCL      = exp(ci_est[,2]),
+  P_value  = p_vals
+)
+
+############################
+# Make Human-Readable Labels
+############################
+results <- results %>%
+  mutate(
+    Variable = dplyr::recode(
+      Variable,
+      `(Intercept)` = "Intercept",
+      depressed     = "Depression (yes vs no)",
+      RIDAGEYR      = "Age (years)",
+      RIAGENDR      = "Sex (female vs male)",
+      SLD012        = "Sleep duration (hours/night)"
+    )
+  )
+
+############################
+# Round for Journal Table
+############################
+results <- results %>%
+  mutate(
+    aOR   = round(aOR, 2),
+    LCL   = round(LCL, 2),
+    UCL   = round(UCL, 2),
+    P_value = ifelse(P_value < 0.001, "<0.001", round(P_value, 3))
+  ) %>%
+  select(Variable, aOR, LCL, UCL, P_value)
+
+###############
+# Print Table Nicely
+###############
+print(results)
+
+###############
+# Save as CSV
+###############
+write.csv(results, "Table_Logistic_Results.csv", row.names = FALSE)
+```
+
+
+#Model diagnostics
+```{r}
+# 1) Build diagnostic dataset (complete cases)
+diag_data <- analytic_imp %>%
+  select(obese, depressed, RIDAGEYR, RIAGENDR, SLD012) %>%
+  filter(
+    !is.na(obese),
+    !is.na(depressed),
+    !is.na(RIDAGEYR),
+    !is.na(RIAGENDR),
+    !is.na(SLD012)
+  ) %>%
+  mutate(
+    obese_num = if_else(obese == 1, 1, 0),
+    RIAGENDR  = factor(RIAGENDR)
+  )
+
+# 2) Fit an unweighted glm for diagnostics
+glm_diag <- glm(
+  obese_num ~ depressed + RIDAGEYR + RIAGENDR + SLD012,
+  data = diag_data,
+  family = binomial()
+)
+
+summary(glm_diag)
+
+###############################################################
+# 3) Multicollinearity Diagnostics (VIF)
+###############################################################
+
+vif(glm_diag)
+
+###############################################################
+# 4) Influential Observations (Cook's Distance)
+###############################################################
+
+cooksD <- cooks.distance(glm_diag)
+
+# Plot Cook’s Distance
+plot(
+  cooksD,
+  type = "h",
+  ylab = "Cook's distance",
+  main = "Cook's Distance: Influential points"
+)
+abline(h = 4/length(cooksD), lty = 2, col = "red")
+
+# List influential obs
+which(cooksD > 4/length(cooksD))
+
+###############################################################
+# 5) Hosmer–Lemeshow Goodness-of-Fit
+###############################################################
+
+library(ResourceSelection)
+hl_test <- hoslem.test(
+  glm_diag$y,
+  fitted(glm_diag),
+  g = 10
+)
+hl_test
+
+###############################################################
+# 6) Residual Plots: Deviance and Pearson
+###############################################################
+
+pearson_res <- residuals(glm_diag, type = "pearson")
+dev_res     <- residuals(glm_diag, type = "deviance")
+fitted_vals <- fitted(glm_diag)
+
+# Pearson residuals vs fitted
+plot(
+  fitted_vals, pearson_res,
+  main = "Pearson residuals vs fitted values",
+  xlab = "Fitted values",
+  ylab = "Pearson residuals"
+)
+abline(h = 0, col = "red")
+
+# Deviance residuals vs fitted
+plot(
+  fitted_vals, dev_res,
+  main = "Deviance residuals vs fitted values",
+  xlab = "Fitted values",
+  ylab = "Deviance residuals"
+)
+abline(h = 0, col = "red")
+
+###############################################################
+# 7) Linearity of the logit for continuous predictors
+###############################################################
+
+# Component + residual plots
+crPlots(glm_diag, terms = ~ RIDAGEYR + SLD012)
+```
+Interpretation
+When evaluating the model diagnostics, I found that the assumption of no multicollinearity was satisfied, as all VIF values were close to 1 and well below the accepted threshold of 5. Influence diagnostics also showed no concerning observations, with all Cook’s distance values remaining far below 1. Although the Hosmer–Lemeshow goodness-of-fit test was statistically significant, which would typically suggest lack of fit, this test is known to be overly sensitive in large datasets. Given that all other diagnostic assessments indicated no issues with model performance, I proceeded with the model and interpreted the results accordingly.
+
+#Effect modification (Depression and sex)
+```{r}
+fit_interaction <- svyglm(
+  obese ~ depressed * RIAGENDR + RIDAGEYR + SLD012,
+  design = design_imp,
+  family = quasibinomial()
+)
+
+summary(fit_interaction)
+coef_int <- coef(fit_interaction)
+ci_int   <- confint(fit_interaction)
+
+aor_interaction <- data.frame(
+  Variable = names(coef_int),
+  aOR      = round(exp(coef_int), 3),
+  LCL      = round(exp(ci_int[, 1]), 3),
+  UCL      = round(exp(ci_int[, 2]), 3)
+)
+
+aor_interaction
+```
+Interpretation
+The effect modification test evaluating the interaction between depression and sex was not statistically significant, with p > 0.05.
+
+#Journal ready Effect modification table.
+```{r}
+# Extract estimates, CI, and p-values
+coef_int <- coef(fit_interaction)
+ci_int   <- confint(fit_interaction)
+p_vals   <- summary(fit_interaction)$coefficients[, 4]
+
+results_int <- data.frame(
+  Variable = names(coef_int),
+  aOR      = exp(coef_int),
+  LCL      = exp(ci_int[,1]),
+  UCL      = exp(ci_int[,2]),
+  P_value  = p_vals
+)
+
+############################
+# Label the variables
+############################
+results_int <- results_int %>%
+  mutate(
+    Variable = dplyr::recode(
+      Variable,
+      `(Intercept)`        = "Intercept",
+      depressed            = "Depression (yes vs no)",
+      RIAGENDR             = "Sex (female vs male)",
+      `depressed:RIAGENDR` = "Interaction: Depression × Sex",
+      RIDAGEYR             = "Age (years)",
+      SLD012               = "Sleep duration (hours/night)"
+    )
+  )
+
+############################
+# Round and format
+############################
+results_int <- results_int %>%
+  mutate(
+    aOR   = round(aOR, 2),
+    LCL   = round(LCL, 2),
+    UCL   = round(UCL, 2),
+    P_value = ifelse(P_value < 0.001, "<0.001", round(P_value, 3))
+  ) %>%
+  select(Variable, aOR, LCL, UCL, P_value)
+
+############################
+# Print Table
+############################
+print(results_int)
+
+############################
+# Save as CSV (downloadable)
+############################
+write.csv(results_int, "Table_Interaction_Results.csv", row.names = FALSE)
+```
+
+#Sensetivity analysis (Complete-case)
+```{r}
+complete_cc <- analytic_data %>%
+  filter(!is.na(SLD012))
+
+# 2) Set up survey design using complete-case data
+design_cc <- svydesign(
+  id      = ~SDMVPSU,
+  strata  = ~SDMVSTRA,
+  weights = ~WTMEC2YR,
+  nest    = TRUE,
+  data    = complete_cc
+)
+
+# 3) Fit the complete-case model
+fit_cc <- svyglm(
+  obese ~ depressed + RIDAGEYR + RIAGENDR + SLD012,
+  design = design_cc,
+  family = quasibinomial()
+)
+
+summary(fit_cc)
+
+# 4) Extract aORs and 95% CI
+coef_cc <- coef(fit_cc)
+ci_cc   <- confint(fit_cc)
+
+aor_cc <- data.frame(
+  Variable = names(coef_cc),
+  aOR      = round(exp(coef_cc), 3),
+  LCL      = round(exp(ci_cc[, 1]), 3),
+  UCL      = round(exp(ci_cc[, 2]), 3)
+)
+
+aor_cc
+```
+Interpretation
+The complete-case analysis showed that the association between depression and obesity was not significant, with an AOR = 1.399 (95% CI: 0.999–1.958); p > 0.05.
+
+#Flow chart
+```{r}
+N0 <- nrow(mydata)
+
+# N1: Adults ≥ 18 years
+step1 <- mydata %>%
+  filter(RIDAGEYR >= 18)
+N1 <- nrow(step1)
+
+# N2: Exclude pregnant (RIDEXPRG == 1)
+step2 <- step1 %>%
+  filter(is.na(RIDEXPRG) | RIDEXPRG != 1)
+
+# Add PHQ-9 total (DPQ010–DPQ090)
+step2 <- step2 %>%
+  mutate(
+    PHQ9_total = DPQ010 + DPQ020 + DPQ030 + DPQ040 +
+                 DPQ050 + DPQ060 + DPQ070 + DPQ080 + DPQ090
+  )
+N2 <- nrow(step2)
+
+# N3: Exclude missing PHQ-9 total
+step3 <- step2 %>%
+  filter(!is.na(PHQ9_total))
+N3 <- nrow(step3)
+
+# N4: Exclude missing BMI (BMXBMI) – final analytic sample
+step4 <- step3 %>%
+  filter(!is.na(BMXBMI))
+N4 <- nrow(step4)
+
+c(N0 = N0, N1 = N1, N2 = N2, N3 = N3, N4 = N4)
+
+
+## 2. Draw flowchart with DiagrammeR ---------------------------
+
+grViz(paste0("
+digraph flowchart {
+
+  graph [layout = dot, rankdir = TB]
+
+  node [fontname = Helvetica, shape = rectangle, fontsize = 14, width = 3]
+
+  node1 [label = 'NHANES 2021–2023 participants\\nN = ", N0, "']
+  node2 [label = 'Adults ≥ 18 years\\nN = ", N1, "']
+  node3 [label = 'Excluded: pregnant (RIDEXPRG = 1)\\nRemaining N = ", N2, "']
+  node4 [label = 'Excluded: missing PHQ-9 total (DPQ010–DPQ090)\\nRemaining N = ", N3, "']
+  node5 [label = 'Excluded: missing BMI (BMXBMI)\\nFinal analytic sample\\nN = ", N4, "']
+  node6 [label = 'Missing sleep duration (SLD012)\\nHandled by multiple imputation\\nNo additional exclusions']
+
+  node1 -> node2 -> node3 -> node4 -> node5 -> node6
+}
+"))
+# PHQ-9 complete
+step3 <- step2 %>%
+  mutate(PHQ9_total = DPQ010 + DPQ020 + DPQ030 + DPQ040 +
+                        DPQ050 + DPQ060 + DPQ070 + DPQ080 + DPQ090) %>%
+  filter(!is.na(PHQ9_total))
+N3 <- nrow(step3)
+
+# BMI complete
+step4 <- step3 %>% filter(!is.na(BMXBMI))
+N4 <- nrow(step4)
+
+# Print counts
+c(N0 = N0, N1 = N1, N2 = N2, N3 = N3, N4 = N4)
+```
+
+```{r}
+# Make a copy just for descriptives
+desc_data <- analytic_imp
+
+# Recodes for readability ----------------------------------------
+desc_data <- desc_data %>%
+  mutate(
+    sex = factor(RIAGENDR,
+                 levels = c(1, 2),
+                 labels = c("Male", "Female")),
+    dep_status = factor(depressed,
+                        levels = c(0, 1),
+                        labels = c("No depression", "Depression")),
+    obese_status = factor(obese,
+                          levels = c(0, 1),
+                          labels = c("Not obese", "Obese"))
+  )
+
+# Variable labels for table1 --------------------------------------
+label(desc_data$RIDAGEYR)   <- "Age (years)"
+label(desc_data$SLD012)     <- "Sleep duration (hours/night)"
+label(desc_data$BMXBMI)     <- "BMI (kg/m²)"
+label(desc_data$sex)        <- "Sex"
+label(desc_data$dep_status) <- "Depression status"
+label(desc_data$obese_status) <- "Obesity status"
+
+# Descriptive table by depression status --------------------------
+table1(
+  ~ RIDAGEYR + SLD012 + BMXBMI + sex |
+    dep_status,
+  data = desc_data,
+  overall = "Total"
+)
+
+```
+Interpretation
+In this sample of 5,420 adults, 13.6% had depression. Participants with depression tended be younger than those without depression (mean age: 47.2 vs 53.2 years). Sleep duration was slightly lower among individuals with depression (7.55 vs 7.72 hours per night). BMI was modestly higher among the depression group, suggesting a greater burden of overweight and obesity relative to those without depression (30.8 vs 29.4 kg/m²).
+
+Sex distributions differed between the two groups: among individuals with depression, a larger proportion were female (63%) compared to those without depression (52.6%). Conversely, males made up a smaller proportion of the depression group (37.0%) than the non-depressed group (47.4%).
+
+Overall, these descriptive findings indicate that depression is associated with younger age, slightly shorter sleep duration, and higher BMI, and is notably more prevalent among females.
+```{r}
+
+```
